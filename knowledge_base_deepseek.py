@@ -26,6 +26,29 @@ import hashlib
 # API Key 管理模块
 CONFIG_FILE = os.path.join(".", ".deepseek_config.json")
 
+# DeepSeek 对话 API：开放平台「官方显示名」-> 请求体 `model` 字段（与官方文档 / 价格页一致）
+DEEPSEEK_CHAT_MODELS: Dict[str, str] = {
+    "DeepSeek-V4-Flash": "deepseek-v4-flash",
+    "DeepSeek-V4-Pro": "deepseek-v4-pro",
+    "DeepSeek-Chat": "deepseek-chat",
+    "DeepSeek-Coder": "deepseek-coder",
+}
+
+# 与 https://api-docs.deepseek.com/quick_start/pricing 中 V4 系列一致：上下文 1M tokens、单次补全 max_tokens 至多为约 384K
+# 字符上限为对「1M token」的启发式工程预算（为 system/输出留余量），避免本机/单次 user 报文无界；极密中文仍可能触服务端限制
+DEEPSEEK_V4_MAX_OUTPUT_TOKENS = 384_000
+DEEPSEEK_V4_MAX_USER_PROMPT_CHARS = 900_000
+
+def _clip_user_prompt_for_api(user_prompt: str) -> str:
+    """在发往 API 前限制 user 提示长度（近似对齐官方 1M 上下文，留出头信息空间）。"""
+    m = DEEPSEEK_V4_MAX_USER_PROMPT_CHARS
+    if len(user_prompt) <= m:
+        return user_prompt
+    return (
+        user_prompt[:m]
+        + f"\n\n[... 已在 {m:,} 字符处截断。V4 官方标称上下文约 1M tokens；可分批提问或分段处理更长语料。]"
+    )
+
 # Prompt 模版管理模块
 PROMPT_TEMPLATES_DIR = os.path.join(".", "prompt_templates")
 SUMMARY_TEMPLATES_FILE = os.path.join(PROMPT_TEMPLATES_DIR, "summary_templates.json")
@@ -2049,20 +2072,30 @@ def create_local_vector_store(docs_dict: Dict[str, Any], progress_callback=None,
         raise Exception(error_detail)
 
 # DeepSeek API接口
-def query_deepseek(prompt: str, api_key: str, model: str = "deepseek-chat", max_tokens: int = 2000, 
-                   max_retries: int = 3, timeout: int = None):
+def query_deepseek(
+    prompt: str,
+    api_key: str,
+    model: str = "deepseek-chat",
+    max_tokens: Optional[int] = None,
+    max_retries: int = 3,
+    timeout: int = None,
+):
     """调用DeepSeek API，带重试机制
     
     Args:
         prompt: 提示文本
         api_key: DeepSeek API密钥
         model: 模型名称
-        max_tokens: 最大token数
+        max_tokens: 最大生成 token 数，默认用官方 V4 标称单条输出上限；具体以所调模型与接口为准
         max_retries: 最大重试次数
         timeout: 超时时间（秒），如果为None则使用默认值或从session_state获取
     """
     import requests
     import time
+
+    if max_tokens is None:
+        max_tokens = DEEPSEEK_V4_MAX_OUTPUT_TOKENS
+    prompt = _clip_user_prompt_for_api(prompt)
     
     # 从 session_state 获取超时和重试配置（如果可用）
     if timeout is None:
@@ -2126,7 +2159,7 @@ def query_deepseek(prompt: str, api_key: str, model: str = "deepseek-chat", max_
                 # 检查是否是上下文长度超限错误
                 error_text = response.text.lower()
                 if "context" in error_text and ("length" in error_text or "exceeded" in error_text or "too long" in error_text):
-                    return "❌ 文档内容过长，超过了API的上下文窗口限制（64K tokens）。\n\n建议：\n1. 减少选择的文档数量\n2. 或者使用分块总结功能（如果可用）\n3. 或者先对每篇文档进行摘要，再总结摘要内容"
+                    return "❌ 输入内容（提示词/文档）已超出当前模型在接口侧的上下文或参数限制。V4 标称约 1M 上下文、384K 输出，具体以官方文档与报错为准。\n\n建议：\n1. 减少当次选入的文档或分块/分批处理\n2. 使用分块或分段总结\n3. 先为单篇做摘要，再对摘要做汇总"
                 else:
                     return f"API请求参数错误 (状态码: 400): {response.text[:200]}"
             else:
@@ -2286,7 +2319,16 @@ def web_search(query: str, max_results: int = 3) -> tuple[str, List[Dict[str, st
     except Exception as e:
         return f"联网搜索功能出错: {str(e)}", []
 
-def answer_with_deepseek(question: str, vectorstore, docs_dict: Dict[str, Any], api_key: str, enable_web_search: bool = False, web_search_results: str = "", web_search_refs: List[Dict[str, str]] = None):
+def answer_with_deepseek(
+    question: str,
+    vectorstore,
+    docs_dict: Dict[str, Any],
+    api_key: str,
+    enable_web_search: bool = False,
+    web_search_results: str = "",
+    web_search_refs: List[Dict[str, str]] = None,
+    model: str = "deepseek-chat",
+):
     """使用DeepSeek回答问题
     
     Args:
@@ -2297,14 +2339,21 @@ def answer_with_deepseek(question: str, vectorstore, docs_dict: Dict[str, Any], 
         enable_web_search: 是否启用联网搜索
         web_search_results: 联网搜索结果文本（如果已在外部执行搜索，可以传入）
         web_search_refs: 联网搜索结果的结构化数据（用于显示参考来源）
+        model: API 模型标识，如 deepseek-v4-flash
     """
     # 检索相关文档片段
     similar_docs = search_similar_documents(vectorstore, question)
     
     if not similar_docs:
-        # 如果没有向量数据库，使用所有文档内容
-        context = "\n\n".join([f"文件: {name}\n内容: {data['content'][:2000]}..." 
-                             for name, data in docs_dict.items()])
+        # 如果没有向量数据库，使用所有文档内容（由 query_deepseek 内按 1M 上下文做近似截断）
+        def _as_text(data_content):
+            c = data_content
+            if isinstance(c, dict):
+                c = "\n".join([f"{k}: {v}" for k, v in c.items()])
+            return c if isinstance(c, str) else str(c)
+        context = "\n\n".join(
+            [f"文件: {name}\n{_as_text(data['content'])}" for name, data in docs_dict.items()]
+        )
     else:
         # 使用检索到的文档片段
         context_parts = []
@@ -2325,10 +2374,10 @@ def answer_with_deepseek(question: str, vectorstore, docs_dict: Dict[str, Any], 
         prompt = f"""基于以下文档内容和联网搜索结果，请回答这个问题：{question}
 
 相关文档内容：
-{context[:6000]}
+{context}
 
 联网搜索结果：
-{web_search_results[:2000]}
+{web_search_results or ""}
 
 请优先基于文档内容回答，如果文档中没有相关信息，可以参考联网搜索结果。请在回答中明确说明是否使用了联网搜索结果。"""
     elif enable_web_search and not web_search_results:
@@ -2336,7 +2385,7 @@ def answer_with_deepseek(question: str, vectorstore, docs_dict: Dict[str, Any], 
         prompt = f"""基于以下文档内容，请回答这个问题：{question}
 
 相关文档内容：
-{context[:8000]}
+{context}
 
 注意：已启用联网搜索功能，但未能获取到相关的联网搜索结果。请基于文档内容回答，如果文档中没有相关信息，请明确说明。"""
     else:
@@ -2344,13 +2393,19 @@ def answer_with_deepseek(question: str, vectorstore, docs_dict: Dict[str, Any], 
         prompt = f"""基于以下文档内容，请回答这个问题：{question}
 
 相关文档内容：
-{context[:8000]}
+{context}
 
 请基于上述文档内容回答，如果文档中没有相关信息，请明确说明。"""
 
-    return query_deepseek(prompt, api_key)
+    return query_deepseek(prompt, api_key, model=model)
 
-def generate_summary_deepseek(docs_dict: Dict[str, Any], api_key: str, specific_files: List[str] = None, template_id: str = "default"):
+def generate_summary_deepseek(
+    docs_dict: Dict[str, Any],
+    api_key: str,
+    specific_files: List[str] = None,
+    template_id: str = "default",
+    model: str = "deepseek-chat",
+):
     """使用DeepSeek生成总结报告
     
     Args:
@@ -2358,6 +2413,7 @@ def generate_summary_deepseek(docs_dict: Dict[str, Any], api_key: str, specific_
         api_key: API密钥
         specific_files: 特定文件列表（None表示所有文件）
         template_id: 使用的模版ID（默认为"default"）
+        model: API 模型标识
     """
     # 提取内容
     contents = []
@@ -2401,7 +2457,7 @@ def generate_summary_deepseek(docs_dict: Dict[str, Any], api_key: str, specific_
 
 报告："""
 
-    return query_deepseek(prompt, api_key, max_tokens=3000)
+    return query_deepseek(prompt, api_key, model=model)
 
 # 显示版权信息
 def show_footer():
@@ -2842,12 +2898,18 @@ def main():
         else:
             st.caption("💡 输入密钥后会自动保存到本地")
         
-        # 模型选择
-        model_choice = st.selectbox(
+        # 模型选择（下拉为官方显示名，请求时映射为 API model 参数）
+        _chat_model_options = list(DEEPSEEK_CHAT_MODELS.keys())
+        _default_display = "DeepSeek-Chat"
+        _chat_index = _chat_model_options.index(_default_display) if _default_display in _chat_model_options else 0
+        selected_chat_model_display = st.selectbox(
             "选择模型",
-            ["deepseek-chat", "deepseek-coder"],
-            help="deepseek-chat: 通用对话模型\ndeepseek-coder: 代码专用模型"
+            options=_chat_model_options,
+            index=_chat_index,
+            help="名称与 DeepSeek 开放平台「模型与价格」一致。V4 为百万级上下文；Chat 偏通用、Coder 偏代码。",
+            key="deepseek_chat_model_display",
         )
+        chat_model_id = DEEPSEEK_CHAT_MODELS[selected_chat_model_display]
         
         # API 超时和重试配置（高级设置）
         if 'api_timeout' not in st.session_state:
@@ -3658,7 +3720,8 @@ def main():
                             st.session_state.docs, 
                             api_key,
                             specific_files=files_to_summarize,
-                            template_id=st.session_state.selected_summary_template
+                            template_id=st.session_state.selected_summary_template,
+                            model=chat_model_id,
                         )
                         # 生成时间戳（在生成总结时生成，确保同一总结使用相同时间戳）
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3924,7 +3987,8 @@ def main():
                             api_key,
                             enable_web_search=enable_web_search,
                             web_search_results=web_search_results,
-                            web_search_refs=web_search_refs if web_search_refs else None
+                            web_search_refs=web_search_refs if web_search_refs else None,
+                            model=chat_model_id,
                         )
                     
                     # 搜索完成后清除搜索状态提示，并显示搜索结果状态
@@ -4177,7 +4241,7 @@ def main():
 2. 潜在的数据模式和趋势
 3. 建议的数据可视化方式"""
                             
-                            analysis = query_deepseek(prompt, api_key)
+                            analysis = query_deepseek(prompt, api_key, model=chat_model_id)
                             st.session_state.analysis_result = analysis
                             st.session_state.analysis_template_name = template_data.get('name', '默认模版') if template_data else '默认模版'
                 
@@ -4449,6 +4513,17 @@ def simple_main():
                 else:
                     st.warning("请输入密钥")
         
+        _simple_model_opts = list(DEEPSEEK_CHAT_MODELS.keys())
+        _si = _simple_model_opts.index("DeepSeek-Chat") if "DeepSeek-Chat" in _simple_model_opts else 0
+        _simple_display = st.selectbox(
+            "选择模型",
+            options=_simple_model_opts,
+            index=_si,
+            help="与 DeepSeek 开放平台「模型与价格」中名称一致。",
+            key="simple_deepseek_chat_model",
+        )
+        simple_chat_model_id = DEEPSEEK_CHAT_MODELS[_simple_display]
+        
         question = st.text_input("输入问题")
         
         if st.button("获取答案") and api_key and question:
@@ -4463,14 +4538,14 @@ def simple_main():
             # 调用DeepSeek
             prompt = f"""基于以下文档内容回答问题：
 
-{all_content[:8000]}
+{all_content}
 
 问题：{question}
 
 请基于文档内容回答，如果文档中没有相关信息，请明确说明。"""
             
             with st.spinner("正在思考..."):
-                answer = query_deepseek(prompt, api_key)
+                answer = query_deepseek(prompt, api_key, model=simple_chat_model_id)
                 st.write("**答案：**", answer)
         
         # 显示版权信息
