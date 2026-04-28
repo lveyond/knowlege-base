@@ -2439,8 +2439,8 @@ def generate_summary_deepseek(
     template_data = get_template("summary", template_id)
     if template_data:
         template_str = template_data.get("template", "")
-        # 替换模版中的占位符（移除字符限制，让API自行处理）
-        prompt = template_str.format(content=combined_content)
+        # 用 replace 而非 str.format：用户模版中可含任意 {、}（如表格、JSON），避免 ValueError
+        prompt = template_str.replace("{content}", combined_content)
     else:
         # 如果模版不存在，使用默认模版
         prompt = f"""请根据以下文档内容，生成一份详细的总结报告：
@@ -4227,8 +4227,7 @@ def main():
                             
                             if template_data:
                                 template_str = template_data.get("template", "")
-                                # 替换模版中的占位符
-                                prompt = template_str.format(doc_info=doc_info)
+                                prompt = template_str.replace("{doc_info}", doc_info)
                             else:
                                 # 如果模版不存在，使用默认模版
                                 prompt = f"""请分析以下文档集合，提供数据分析:
