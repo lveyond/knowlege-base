@@ -2209,6 +2209,38 @@ def search_similar_documents(vectorstore, query: str, k: int = 4):
     except:
         return []
 
+def _web_search_ddgs_timeout() -> int:
+    """ddgs 默认 timeout=5 在慢网络下极易失败，此处放宽并通过环境变量可调。"""
+    try:
+        v = int(os.environ.get("DDGS_TIMEOUT", "30"))
+        return max(5, min(v, 120))
+    except ValueError:
+        return 30
+
+
+def _web_search_verify_arg():
+    """SSL：部分网络环境需设置环境变量 DDGS_VERIFY=0（慎用）。"""
+    v = os.environ.get("DDGS_VERIFY", "1").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
+def _format_web_search_results(results: List[dict]) -> tuple[str, List[Dict[str, str]]]:
+    """将搜索引擎返回的 dict 列表转为提示文本与结构化引用。"""
+    if not results:
+        return "", []
+    search_results_text = []
+    structured_results: List[Dict[str, str]] = []
+    for i, result in enumerate(results, 1):
+        title = result.get("title", "") or ""
+        snippet = result.get("body", "") or result.get("snippet", "") or ""
+        url = result.get("href", "") or result.get("url", "") or ""
+        search_results_text.append(f"[{i}] {title}\n来源: {url}\n摘要: {snippet}")
+        structured_results.append({"title": title, "url": url, "snippet": snippet})
+    return "\n\n".join(search_results_text), structured_results
+
+
 def check_web_search_available() -> Tuple[bool, str]:
     """检查联网搜索库是否可用
     
@@ -2216,28 +2248,25 @@ def check_web_search_available() -> Tuple[bool, str]:
         (是否可用, 错误信息或成功信息)
     """
     try:
-        # 优先尝试使用新的 ddgs 库
         try:
-            from ddgs import DDGS
-            # 尝试创建一个实例来验证库是否正常工作
-            with DDGS() as ddgs:
-                pass
+            import ddgs  # noqa: F401
+            from ddgs import DDGS  # noqa: F401
             return True, "ddgs 库已安装并可用"
         except ImportError:
-            # 如果新库不存在，尝试使用旧的 duckduckgo_search 库
             try:
-                from duckduckgo_search import DDGS
                 import warnings
-                # 忽略重命名警告
+                from duckduckgo_search import DDGS  # noqa: F401
                 with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=RuntimeWarning)
-                    with DDGS() as ddgs:
-                        pass
-                return True, "duckduckgo-search 库已安装（建议升级到 ddgs: pip install ddgs）"
+                    warnings.simplefilter("ignore")
+                return True, "duckduckgo-search 库已安装（建议改用: pip install ddgs）"
             except ImportError:
-                return False, "未安装搜索库，请运行: pip install ddgs（或 pip install duckduckgo-search）"
+                return (
+                    False,
+                    "未安装搜索库。请在运行 Streamlit 的同一 Python 环境中执行: pip install ddgs",
+                )
     except Exception as e:
         return False, f"搜索库存在问题: {str(e)}"
+
 
 def web_search(query: str, max_results: int = 3) -> tuple[str, List[Dict[str, str]]]:
     """执行联网搜索
@@ -2251,73 +2280,58 @@ def web_search(query: str, max_results: int = 3) -> tuple[str, List[Dict[str, st
         搜索结果文本：用于AI回答的文本格式
         结构化结果列表：包含title, url, snippet的字典列表，用于显示参考来源
     """
+    q = (query or "").strip()
+    if not q:
+        return "", []
+
+    errs: List[str] = []
+    timeout = _web_search_ddgs_timeout()
+    verify = _web_search_verify_arg()
+
+    # 1) 新版 ddgs：无结果时常抛异常；默认 timeout=5 在慢网络下易全部失败
     try:
-        # 优先尝试使用新的 ddgs 库
+        from ddgs import DDGS
+
+        client = DDGS(timeout=timeout, verify=verify)
         try:
-            from ddgs import DDGS
-            
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=max_results))
-                
-                if results:
-                    search_results_text = []
-                    structured_results = []
-                    for i, result in enumerate(results, 1):
-                        title = result.get('title', '')
-                        snippet = result.get('body', '')
-                        url = result.get('href', '')
-                        search_results_text.append(f"[{i}] {title}\n来源: {url}\n摘要: {snippet}")
-                        structured_results.append({
-                            'title': title,
-                            'url': url,
-                            'snippet': snippet
-                        })
-                    
-                    return "\n\n".join(search_results_text), structured_results
-                else:
-                    return "", []  # 没有搜索结果
-        except ImportError:
-            # 如果新库不存在，尝试使用旧的 duckduckgo_search 库
-            try:
-                from duckduckgo_search import DDGS
-                import warnings
-                
-                # 忽略重命名警告
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=RuntimeWarning)
-                    with DDGS() as ddgs:
-                        results = list(ddgs.text(query, max_results=max_results))
-                        
-                        if results:
-                            search_results_text = []
-                            structured_results = []
-                            for i, result in enumerate(results, 1):
-                                title = result.get('title', '')
-                                snippet = result.get('body', '')
-                                url = result.get('href', '')
-                                search_results_text.append(f"[{i}] {title}\n来源: {url}\n摘要: {snippet}")
-                                structured_results.append({
-                                    'title': title,
-                                    'url': url,
-                                    'snippet': snippet
-                                })
-                            
-                            return "\n\n".join(search_results_text), structured_results
-                        else:
-                            return "", []  # 没有搜索结果
-            except ImportError:
-                # 如果两个库都不存在，返回空（错误提示已在调用前显示）
-                return "", []
-            except Exception as e:
-                # 旧库调用出错
-                error_msg = str(e)
-                return f"联网搜索时出错: {error_msg}", []
+            raw = client.text(q, max_results=max_results)
         except Exception as e:
-            # 新库调用出错
-            error_msg = str(e)
-            return f"联网搜索时出错: {error_msg}", []
+            em = str(e).lower()
+            if "no results" in em or "no results found" in em:
+                return "", []
+            errs.append(f"ddgs({e})")
+        else:
+            if raw:
+                seq = list(raw) if not isinstance(raw, list) else raw
+                return _format_web_search_results(seq)
+            return "", []
+    except ImportError:
+        pass
     except Exception as e:
-        return f"联网搜索功能出错: {str(e)}", []
+        errs.append(f"ddgs({e})")
+
+    # 2) 旧包 duckduckgo-search 作为回退（ddgs 未安装或上文已记录 ddgs 调用失败）
+    try:
+        import warnings
+        from duckduckgo_search import DDGS
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            with DDGS() as ddg:
+                results = ddg.text(q, max_results=max_results)
+                seq = list(results) if results is not None else []
+        return _format_web_search_results(seq)
+    except ImportError:
+        if errs:
+            return f"联网搜索时出错: {'; '.join(errs)}", []
+        return "", []
+    except Exception as e:
+        errs.append(f"duckduckgo_search({e})")
+
+    if errs:
+        return f"联网搜索时出错: {'; '.join(errs)}", []
+    return "", []
 
 def answer_with_deepseek(
     question: str,
@@ -3917,9 +3931,7 @@ def main():
             if enable_web_search != st.session_state.enable_web_search:
                 st.session_state.enable_web_search = enable_web_search
                 if save_web_search_config(enable_web_search):
-                    if enable_web_search:
-                        st.success("✅ 已启用联网搜索功能（仅用于智能问答）")
-                    else:
+                    if not enable_web_search:
                         st.info("ℹ️ 已禁用联网搜索功能")
         
         # 处理搜索答案的逻辑（移到列布局外，使内容占据全宽）
